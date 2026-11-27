@@ -172,6 +172,53 @@ function mergeExtras(who, extras){
   return who;
 }
 
+function parseScamText(txt){
+  if(!txt || txt.indexOf("Fraud Score") < 0) return null;
+  var m = /"score"\s*:\s*"(\d+)"/.exec(txt) || /Fraud Score:?\s*(\d+)/.exec(txt);
+  var score = m ? parseInt(m[1], 10) : null;
+  var m2 = /"risk"\s*:\s*"([a-z ]+)"/.exec(txt) || /(Very High|High|Medium|Low)\s*Risk/.exec(txt);
+  var risk = m2 ? m2[1] : null;
+  risk = ({low:"Low", medium:"Medium", high:"High", "very high":"Very High"})[(risk || "").toLowerCase()] || risk;
+  if(score == null && !risk) return null;
+  var f = {};
+  var re = /^\|\s*([A-Za-z0-9 \/]+?)\s*\|\s*([^|\n]+?)\s*\|\s*$/gm;
+  var mm;
+  while((mm = re.exec(txt))){
+    f[mm[1].trim()] = mm[2].trim();
+  }
+  function g(k){
+    return (f[k] || "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").trim();
+  }
+  return {
+    score: score, risk: risk,
+    country_code: g("Country Code"),
+    country_name: g("Country Name"),
+    isp: g("ISP Name"),
+    connection_type: g("Connection type"),
+    datacenter: g("Datacenter"),
+    server: g("Server"),
+    vpn: g("Anonymizing VPN"),
+    residential_proxy: g("Residential Proxy"),
+    blacklists: {
+      "Firehol": g("Firehol"), "IP2ProxyLite": g("IP2ProxyLite"),
+      "IPsum": g("IPsum"), "Spamhaus": g("Spamhaus"),
+      "X4Bnet Spambot": g("X4Bnet Spambot")
+    }
+  };
+}
+
+async function getScamViaJina(ip){
+  var url = "https://r.jina.ai/https://scamalytics.com/ip/" + ip;
+  var c = new AbortController();
+  var t = setTimeout(function(){ c.abort(); }, 40000);
+  try{
+    var r = await fetch(url, {signal: c.signal});
+    if(!r.ok) return null;
+    return parseScamText(await r.text());
+  }catch(e){ return null; }
+  finally{ clearTimeout(t); }
+}
+
 function rtcProbe(){
   return new Promise(function(res){
     var done = false, ips = [];
@@ -227,7 +274,7 @@ function judgeNative(who, scam, extras){
 }
 
 function judgeFraud(scam){
-  if(!scam) return ["skip", "点下方 Scamalytics 按钮自动带出本 IP 的欺诈值与风险颜色（黄/绿为可用线）；用电脑端跑则全自动"];
+  if(!scam) return ["skip", "公共读取通道未连通（可能超时/被限流），点下方 Scamalytics 按钮 10 秒核对（黄/绿为可用线）"];
   var hit = false, bl = scam.blacklists || {};
   for(var k in bl){ if(isYes(bl[k])) hit = true; }
   var color = {Low:"绿", Medium:"黄", High:"橙", "Very High":"红"}[scam.risk] || "未知";
@@ -271,15 +318,18 @@ function judgeRtc(ips, exitIp){
   return ["ok", "无泄露（WebRTC 出口与主出口一致）"];
 }
 
-function setMode(full, extras){
+function setMode(full, extras, scamAuto){
   var mb = document.getElementById("modebox");
   if(full){
     mb.innerHTML = '<span class="mode full">完整模式：电脑服务已连接，类型/欺诈值自动核查</span>';
     return;
   }
   var n = 1 + (extras && extras.ipinfo ? 1 : 0) + (extras && extras.ipsb ? 1 : 0);
-  mb.innerHTML = '<span class="mode lite">独立模式（无需电脑，' + n + ' 库交叉）：' +
-    '类型为特征判定，欺诈值点下方 Scamalytics 按钮一键核对</span>';
+  if(scamAuto){
+    mb.innerHTML = '<span class="mode full">独立模式 · 全自动：欺诈值已读取，' + n + ' 库交叉</span>';
+  } else {
+    mb.innerHTML = '<span class="mode lite">独立模式 · ' + n + ' 库交叉：欺诈值通道未通，点下方 Scamalytics 按钮核对</span>';
+  }
 }
 
 async function run(){
@@ -295,16 +345,25 @@ async function run(){
   }
   var ip = who.ip;
   prog.innerHTML = '<span class="spin"></span>正在查询 IP 类型与欺诈值 …';
-  var scam = await getScam(ip);
   var extras = null;
-  if(!scam){
-    prog.innerHTML = '<span class="spin"></span>独立模式：正在多库交叉查询（IPinfo / ip.sb，手机可直连）…';
-    extras = await getExtras(ip);
+  var scam = await getScam(ip);
+  var rtcIps;
+  if(scam){
+    setMode(true, null, true);
+    prog.innerHTML = '<span class="spin"></span>正在做 WebRTC 泄露检测（最长约 9 秒）…';
+    rtcIps = await rtcProbe();
+  } else {
+    prog.innerHTML = '<span class="spin"></span>独立模式：正在读取 Scamalytics 欺诈值（公共通道，约 15~40 秒），同时并行做多库交叉与 WebRTC 检测 …';
+    var scamP = getScamViaJina(ip);
+    var extrasP = getExtras(ip);
+    var rtcP = rtcProbe();
+    extras = await extrasP;
     who = mergeExtras(who, extras);
+    rtcIps = await rtcP;
+    prog.innerHTML = '<span class="spin"></span>等待欺诈值读取完成 …';
+    scam = await scamP;
+    setMode(false, extras, !!scam);
   }
-  setMode(!!scam, extras);
-  prog.innerHTML = '<span class="spin"></span>正在做 WebRTC 泄露检测（最长约 9 秒）…';
-  var rtcIps = await rtcProbe();
 
   var verdicts = [];
   verdicts.push(["IP 类型"].concat(judgeType(who, scam, extras)));
@@ -364,10 +423,11 @@ async function run(){
   outEl.appendChild(card('<p class="ct">整改建议与手机环境五件事</p>' + tipHtml));
 
   outEl.appendChild(card(
-    '<p class="ct">快捷核对（点击直达）</p>' +
-    '<a class="btn" target="_blank" rel="noopener" href="https://scamalytics.com/ip/' + encodeURIComponent(ip) + '">Scamalytics 查欺诈值</a>' +
-    '<a class="btn" target="_blank" rel="noopener" href="https://ipinfo.io/' + encodeURIComponent(ip) + '">IPinfo 查类型(type)</a>' +
+    '<p class="ct">一键复核（点击直达，自动带上当前 IP）</p>' +
+    '<a class="btn" target="_blank" rel="noopener" href="https://scamalytics.com/ip/' + encodeURIComponent(ip) + '">Scamalytics 复核欺诈值</a>' +
+    '<a class="btn" target="_blank" rel="noopener" href="https://ipinfo.io/' + encodeURIComponent(ip) + '">IPinfo 复核类型(type)</a>' +
     '<a class="btn" target="_blank" rel="noopener" href="https://whoer.net">whoer 查伪装度/DNS</a>' +
+    '<p class="tip">除 whoer 外各项已自动检测；whoer 的伪装度/DNS 泄露必须在其页面上由它的脚本计算（服务器拒绝内嵌），用时约 10 秒：看分数（目标 100%）与 DNS 一栏国家（含中国 = DNS 泄露）。</p>' +
     '<p class="tip">建议把本页「添加到主屏幕」，之后像 App 一样全屏点开：安卓 Chrome 菜单「⋮」→ 添加到主屏幕；iPhone Safari 分享 → 添加到主屏幕。在微信里打开链接后若某项检测异常（如 WebRTC），点右上角「···」→ 在浏览器打开。</p>' +
     '<p class="tip">各检测网站数据库不同，结果打架时多测几遍取共同结论；网络之外，注册邮箱/号码与养号手法同样决定账号安全。</p>'
   ));
